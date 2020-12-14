@@ -47,7 +47,7 @@ instance encodeHTMLWikiPage :: EncodeHTML WikiPage where
 
 type UserResources =
   "profile" := "profile" :/ Resource (Get User JSON)
-  :<|> "friends" := "friends" :/ Resource (Get (Array User) JSON :<|> Post User JSON)
+  :<|> "friends" := "friends" :/ Resource (Get (Array User) JSON :<|> Post Void User JSON)
 
 type TestSite =
   "home" := Resource (Get Home (HTML :<|> JSON))

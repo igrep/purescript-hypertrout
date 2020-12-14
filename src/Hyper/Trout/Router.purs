@@ -29,13 +29,13 @@ import Foreign.Object (lookup) as F
 import Hyper.Conn (Conn)
 import Hyper.ContentNegotiation (AcceptHeader, NegotiationResult(..), negotiateContent, parseAcceptHeader)
 import Hyper.Middleware (Middleware, lift')
-import Hyper.Request (class Request, getRequestData)
+import Hyper.Request (class Request, class ReadableBody, getRequestData, readBody)
 import Hyper.Response (class Response, class ResponseWritable, ResponseEnded, StatusLineOpen, closeHeaders, contentType, end, respond, writeStatus)
-import Hyper.Status (Status, statusBadRequest, statusMethodNotAllowed, statusNotAcceptable, statusNotFound, statusOK)
+import Hyper.Status (Status (Status), statusBadRequest, statusMethodNotAllowed, statusNotAcceptable, statusNotFound, statusOK)
 import Prim.Row (class Cons)
 import Type.Proxy (Proxy(..))
-import Type.Trout (type (:<|>), type (:=), type (:>), Capture, CaptureAll, QueryParam, QueryParams, Lit, Raw)
-import Type.Trout.ContentType (class AllMimeRender, allMimeRender)
+import Type.Trout (type (:<|>), type (:=), type (:>), ReqBody, Capture, CaptureAll, QueryParam, QueryParams, Lit, Raw)
+import Type.Trout.ContentType (class AllMimeRender, class MimeParse, allMimeRender, mimeParse)
 import Type.Trout.PathPiece (class FromPathPiece, fromPathPiece)
 
 type Method' = Either Method CustomMethod
@@ -211,20 +211,20 @@ getAccept m =
     Nothing -> pure Nothing
 
 instance routerAltMethod :: ( IsSymbol method
-                            , Router (Trout.Method method body ct) (Record hs) out
+                            , Router (Trout.Method method reqBody body ct) (Record hs) out
                             , Router methods (Record hs) out
                             )
                         => Router
-                           (Trout.Method method body ct :<|> methods)
+                           (Trout.Method method reqBody body ct :<|> methods)
                            (Record hs)
                            out
   where
   route _ context handlers =
-    route (Proxy :: Proxy (Trout.Method method body ct)) context handlers
+    route (Proxy :: Proxy (Trout.Method method reqBody body ct)) context handlers
     `orHandler`
     route (Proxy :: Proxy methods) context handlers
 
-instance routerMethod :: ( Monad m
+instance routerMethodWithoutRequestBody :: ( Monad m
                          , Request req m
                          , Response res m r
                          , ResponseWritable r m b
@@ -233,7 +233,7 @@ instance routerMethod :: ( Monad m
                          , Cons method (ExceptT RoutingError m body) hs' hs
                          )
                      => Router
-                        (Trout.Method method body ct)
+                        (Trout.Method method Void body ct)
                         (Record hs)
                         (Middleware
                         m
@@ -242,40 +242,91 @@ instance routerMethod :: ( Monad m
                         Unit)
   where
   route proxy context handlers = do
-    let handler = lift' (runExceptT (Record.get (SProxy :: SProxy method) handlers)) `ibind`
-                  case _ of
-                    Left (HTTPError { status }) -> do
-                      writeStatus status
-                      :*> contentType textPlain
-                      :*> closeHeaders
-                      :*> end
-                    Right body -> do
-                      { headers } <- getRequestData
-                      case getAccept headers of
-                        Left err -> do
-                          writeStatus statusBadRequest
-                          :*> contentType textPlain
-                          :*> closeHeaders
-                          :*> end
-                        Right parsedAccept -> do
-                          case negotiateContent parsedAccept (allMimeRender (Proxy :: Proxy ct) body) of
-                            Match (Tuple ct rendered) -> do
-                              writeStatus statusOK
-                              :*> contentType ct
-                              :*> closeHeaders
-                              :*> respond rendered
-                            Default (Tuple ct rendered) -> do
-                              writeStatus statusOK
-                              :*> contentType ct
-                              :*> closeHeaders
-                              :*> respond rendered
-                            NotAcceptable _ -> do
-                              writeStatus statusNotAcceptable
-                              :*> contentType textPlain
-                              :*> closeHeaders
-                              :*> end
+    let handler = lift' (runExceptT (Record.get (SProxy :: SProxy method) handlers))
+          `ibind` makeResponse (Proxy :: Proxy b) (Proxy :: Proxy ct)
     routeEndpoint proxy context handler (SProxy :: SProxy method)
     where bind = ibind
+
+instance routerMethodWithRequestBody :: ( Monad m
+                         , Request req m
+                         , ReadableBody req m reqBody
+                         , Response res m r
+                         , ResponseWritable r m b
+                         , IsSymbol method
+                         , MimeParse reqBody ctReq reqBodyParsed
+                         , AllMimeRender body ct b
+                         , Cons method ( reqBodyParsed -> ExceptT RoutingError m body) hs' hs
+                         )
+                     => Router
+                        (Trout.Method method (ReqBody reqBody ctReq) body ct)
+                        (Record hs)
+                        (Middleware
+                        m
+                        { request :: req, response :: (res StatusLineOpen), components :: c}
+                        { request :: req, response :: (res ResponseEnded), components :: c}
+                        Unit)
+  where
+  route proxy context handlers = do
+    let handler = do
+          reqBody <- readBody
+          r <- lift' $ runExceptT do
+            case mimeParse (Proxy :: Proxy ctReq) reqBody of
+                Right reqBodyParsed -> Record.get (SProxy :: SProxy method) handlers reqBodyParsed
+                Left emsg -> do
+                  let status = Status { code: 422, reasonPhrase: "Unprocessable Entity" }
+                  throwError (HTTPError { status, message: Just emsg })
+          makeResponse (Proxy :: Proxy b) (Proxy :: Proxy ct) r
+    routeEndpoint proxy context handler (SProxy :: SProxy method)
+    where bind = ibind
+
+makeResponse
+  :: forall m req res r body ct b c
+   . Monad m
+  => Request req m
+  => Response res m r
+  => ResponseWritable r m b
+  => AllMimeRender body ct b
+  => Proxy b
+  -> Proxy ct
+  -> Handler body
+  -> (Middleware
+        m
+        { request :: req, response :: (res StatusLineOpen), components :: c} 
+        { request :: req, response :: (res ResponseEnded), components :: c}
+        Unit)
+makeResponse _ _ r =
+  case r of
+    Left (HTTPError { status }) -> do
+      writeStatus status
+      :*> contentType textPlain
+      :*> closeHeaders
+      :*> end
+    Right body -> do
+      { headers } <- getRequestData
+      case getAccept headers of
+        Left err -> do
+          writeStatus statusBadRequest
+          :*> contentType textPlain
+          :*> closeHeaders
+          :*> end
+        Right parsedAccept -> do
+          case negotiateContent parsedAccept (allMimeRender (Proxy :: Proxy ct) body) of
+            Match (Tuple ct rendered) -> do
+              writeStatus statusOK
+              :*> contentType ct
+              :*> closeHeaders
+              :*> respond rendered
+            Default (Tuple ct rendered) -> do
+              writeStatus statusOK
+              :*> contentType ct
+              :*> closeHeaders
+              :*> respond rendered
+            NotAcceptable _ -> do
+              writeStatus statusNotAcceptable
+              :*> contentType textPlain
+              :*> closeHeaders
+              :*> end
+  where bind = ibind
 
 instance routerRaw :: IsSymbol method
                    => Router
