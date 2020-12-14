@@ -247,6 +247,8 @@ instance routerMethodWithoutRequestBody :: ( Monad m
     routeEndpoint proxy context handler (SProxy :: SProxy method)
     where bind = ibind
 
+-- NOTE: Current implementation doesn't read Content-Type request header.
+--       We actually should change ctReq according to that request header.
 instance routerMethodWithRequestBody :: ( Monad m
                          , Request req m
                          , ReadableBody req m reqBody
