@@ -7,11 +7,11 @@ module Hyper.Trout.Router
 
 import Prelude
 import Data.HTTP.Method as Method
-import Type.Trout as Trout
 import Type.Trout.Record as Record
+import Control.Bind.Indexed (idiscard)
 import Control.Monad.Error.Class (throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
-import Control.Monad.Indexed (ibind, (:*>))
+import Control.Monad.Indexed (ibind, ipure)
 import Data.Array (elem, filter, null, uncons)
 import Data.Either (Either(..), either)
 import Data.Generic.Rep (class Generic)
@@ -20,7 +20,7 @@ import Data.Generic.Rep.Show (genericShow)
 import Data.HTTP.Method (CustomMethod, Method)
 import Data.Lazy (force)
 import Data.Maybe (Maybe(..), fromMaybe)
-import Data.MediaType.Common (textPlain)
+import Data.MediaType (MediaType)
 import Data.Symbol (class IsSymbol, SProxy(..), reflectSymbol)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..), fst, lookup, snd)
@@ -30,10 +30,11 @@ import Hyper.Conn (Conn)
 import Hyper.ContentNegotiation (AcceptHeader, NegotiationResult(..), negotiateContent, parseAcceptHeader)
 import Hyper.Middleware (Middleware, lift')
 import Hyper.Request (class Request, class ReadableBody, getRequestData, readBody)
-import Hyper.Response (class Response, class ResponseWritable, ResponseEnded, StatusLineOpen, closeHeaders, contentType, end, respond, writeStatus)
+import Hyper.Response (contentType, closeHeaders, respond, writeStatus, class Response, class ResponseWritable, ResponseEnded, StatusLineOpen)
 import Hyper.Status (Status (Status), statusBadRequest, statusMethodNotAllowed, statusNotAcceptable, statusNotFound, statusOK)
 import Prim.Row (class Cons)
 import Type.Proxy (Proxy(..))
+import Type.Trout as Trout
 import Type.Trout (type (:<|>), type (:=), type (:>), ReqBody, Capture, CaptureAll, QueryParam, QueryParams, Lit, Raw)
 import Type.Trout.ContentType (class AllMimeRender, class MimeParse, allMimeRender, mimeParse)
 import Type.Trout.PathPiece (class FromPathPiece, fromPathPiece)
@@ -238,8 +239,8 @@ instance routerMethodWithoutRequestBody :: ( Monad m
                         (Middleware
                         m
                         { request :: req, response :: (res StatusLineOpen), components :: c}
-                        { request :: req, response :: (res ResponseEnded), components :: c}
-                        Unit)
+                        { request :: req, response :: (res StatusLineOpen), components :: c}
+                        (Either RoutingError (Tuple MediaType b)))
   where
   route proxy context handlers = do
     let handler = lift' (runExceptT (Record.get (SProxy :: SProxy method) handlers))
@@ -265,8 +266,8 @@ instance routerMethodWithRequestBody :: ( Monad m
                         (Middleware
                         m
                         { request :: req, response :: (res StatusLineOpen), components :: c}
-                        { request :: req, response :: (res ResponseEnded), components :: c}
-                        Unit)
+                        { request :: req, response :: (res StatusLineOpen), components :: c}
+                        (Either RoutingError (Tuple MediaType b)))
   where
   route proxy context handlers = do
     let handler = do
@@ -294,40 +295,20 @@ makeResponse
   -> (Middleware
         m
         { request :: req, response :: (res StatusLineOpen), components :: c} 
-        { request :: req, response :: (res ResponseEnded), components :: c}
-        Unit)
+        { request :: req, response :: (res StatusLineOpen), components :: c}
+        (Handler (Tuple MediaType b)))
 makeResponse _ _ r =
   case r of
-    Left (HTTPError { status }) -> do
-      writeStatus status
-      :*> contentType textPlain
-      :*> closeHeaders
-      :*> end
+    Left err -> ipure $ Left err
     Right body -> do
       { headers } <- getRequestData
       case getAccept headers of
-        Left err -> do
-          writeStatus statusBadRequest
-          :*> contentType textPlain
-          :*> closeHeaders
-          :*> end
-        Right parsedAccept -> do
-          case negotiateContent parsedAccept (allMimeRender (Proxy :: Proxy ct) body) of
-            Match (Tuple ct rendered) -> do
-              writeStatus statusOK
-              :*> contentType ct
-              :*> closeHeaders
-              :*> respond rendered
-            Default (Tuple ct rendered) -> do
-              writeStatus statusOK
-              :*> contentType ct
-              :*> closeHeaders
-              :*> respond rendered
-            NotAcceptable _ -> do
-              writeStatus statusNotAcceptable
-              :*> contentType textPlain
-              :*> closeHeaders
-              :*> end
+          Left _ -> ipure $ Left $ HTTPError { status: statusBadRequest, message: Nothing }
+          Right parsedAccept ->
+            case negotiateContent parsedAccept (allMimeRender (Proxy :: Proxy ct) body) of
+              Match negotiationResult -> ipure $ Right negotiationResult
+              Default negotiationResult -> ipure $ Right negotiationResult
+              NotAcceptable _ -> ipure $ Left $ HTTPError { status: statusNotAcceptable, message: Nothing }
   where bind = ibind
 
 instance routerRaw :: IsSymbol method
@@ -367,16 +348,18 @@ instance routerResource :: ( Router methods h out
 
 
 router
-  :: forall s r m req res c
+  :: forall s r resources m req res c b
    . Monad m
   => Request req m
-  => Router s r (Middleware
-                 m
-                 (Conn req (res StatusLineOpen) c)
-                 (Conn req (res ResponseEnded) c)
-                 Unit)
+  => Response res m r
+  => ResponseWritable r m b
+  => Router s resources (Middleware
+                         m
+                         (Conn req (res StatusLineOpen) c)
+                         (Conn req (res StatusLineOpen) c)
+                         (Either RoutingError (Tuple MediaType b)))
   => Proxy s
-  -> r
+  -> resources
   -> (Status
       -> Maybe String
       -> Middleware
@@ -414,6 +397,15 @@ router site handler onRoutingError = do
       ctx <- context <$> getRequestData
       case route site ctx handler of
         Left err → catch err
-        Right h → h
+        Right h → do
+          eres <- h
+          case eres of
+              Left err → catch err
+              Right (Tuple ct rendered) → do 
+                writeStatus statusOK
+                contentType ct
+                closeHeaders
+                respond rendered
 
     bind = ibind
+    discard = idiscard

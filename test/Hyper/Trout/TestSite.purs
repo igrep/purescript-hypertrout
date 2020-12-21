@@ -59,8 +59,10 @@ type TestSite =
   :<|> "search" := "search" :/ QueryParam "q" String :> Resource (Get (Maybe User) JSON)
   -- many query string parameters
   :<|> "searchMany" := "search-many" :/ QueryParams "q" String :> Resource (Get (Array User) JSON)
+  {- FIXME: Support for Raw is dropped!
   -- raw middleware
   :<|> "about" := "about" :/ Raw "GET"
+  -}
 
 testSite :: Proxy TestSite
 testSite = Proxy

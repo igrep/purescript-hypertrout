@@ -75,7 +75,8 @@ spec =
         resources = { home: homeResource
                     , user: userResources
                     , wiki: wikiResource
-                    , about: aboutMiddleware
+                    -- FIXME: Support for Raw is dropped!
+                    -- , about: aboutMiddleware
                     , search: searchResource
                     , searchMany: searchResource
                     }
@@ -158,10 +159,12 @@ spec =
         conn <- makeRequest GET "/search-many?p&q=bunny"
         testStringBody conn `shouldEqual` "[{\"userId\":\"bunny\"}]"
 
+      {- FIXME: Support for Raw is dropped!
       it "matches Raw route" do
         conn <- makeRequest GET "/about"
         testHeaders conn `shouldEqual` [ Tuple "Content-Type" "text/plain" ]
         testStringBody conn `shouldEqual` "This is a test."
+      -}
 
       it "checks HTTP method" do
         conn <- makeRequest POST "/"
